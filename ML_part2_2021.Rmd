@@ -1,0 +1,664 @@
+---
+title: "Machine Learning - More Supervised and Then Unsupervised"
+author: "Vicki Hertzberg"
+date: "4/7/2021"
+output:
+  html_document: default
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+Today we are going to learn about a few more techniques for supervised learning, then we will go into techniques for unsupervised learning.
+
+## More on Supervised Learning
+
+### k-Nearest Neighbor Classification
+
+Another technique is the k-nearest neighbor technique, which is pretty intuitive. Let's say that we have some old observations with outcome variables and associated predictor variables. What the procedure does is place all of the know predictor variables out there in space, then place the point where the predictor variables for the new observation fall. We will then calculate a distance in that space between the new point and the other points. We will then use the k-closest observations close to the new point, and calculate a predicted value for the new point as an average of the outcome variables for those k-nearest neighbors. We typically use Euclidean distance for this calculation. 
+
+We can use the `knn` function in the `class` package to do this. We will have to decide what value of k we are going to use. 
+
+Let's return now to the NHANES Diabetes dataset from last week. 
+
+```{r}
+library(tidyverse)
+library(class)
+library(rpart)
+library(NHANES)
+library(RColorBrewer)
+library(plot3D)
+library(parallel)
+library(randomForestSRC)
+library(ggRandomForests)
+library(mosaic)
+
+# Create the NHANES dataset again
+
+people <- NHANES %>% dplyr::select(Age, Gender, Diabetes, BMI, HHIncome, PhysActive) 
+#%>% na.omit()
+
+glimpse(people)
+
+
+# What is the marginal distribution of Diabetes?
+
+tally(~ Diabetes, data = people, format = "percent")
+```
+
+
+
+
+```{r}
+class(people)
+
+# Convert back to dataframe
+people <- as.data.frame(people)
+glimpse(people)
+
+# Convert factors to numeric - the packages just seem to work better that way
+people$Gender <- as.numeric(people$Gender)
+people$Diabetes <- as.numeric(people$Diabetes)
+people$HHIncome <- as.numeric(people$HHIncome)
+people$PhysActive <- as.numeric(people$PhysActive)
+
+people <- na.omit(people)
+
+glimpse(people)
+
+
+```
+
+
+Now for the procedure
+
+```{r}
+# Apply knn procedure to predict Diabetes
+
+# Let's try different values of k to see how that affects performance
+knn.1 <- knn(train = people, test = people, cl = as.numeric(people$Diabetes), k = 1)
+knn.3 <- knn(train = people, test = people, cl = people$Diabetes, k = 3)
+knn.5 <- knn(train = people, test = people, cl = people$Diabetes, k = 5)
+knn.20 <- knn(train = people, test = people, cl = people$Diabetes, k = 20)
+
+#knn.1
+
+
+```
+
+Now let's see how well it classifies
+
+```{r}
+
+# Calculate the percent predicted correctly
+
+100*sum(people$Diabetes == knn.1)/length(knn.1)
+100*sum(people$Diabetes == knn.3)/length(knn.3)
+100*sum(people$Diabetes == knn.5)/length(knn.5)
+100*sum(people$Diabetes == knn.20)/length(knn.20)
+
+```
+
+We see that as k increases, the prediction worsens, but this will not always be the case.
+
+What about success overall?
+
+```{r}
+
+# Another way to look at success rate against increasing k
+
+table(knn.1, people$Diabetes)
+table(knn.3, people$Diabetes)
+table(knn.5, people$Diabetes)
+table(knn.20, people$Diabetes)
+```
+
+
+
+So which classifier should you choose? Well, the good news is that you don't have to. There is what is called an ensemble method, in which you run several classifiers, then take the majority vote. We are also going to do this over a grid covering the *Age x BMI* space, so that we can do visualize the results from each classifier.
+
+```{r}
+
+# Create the grid
+
+ages <- range(~ Age, data = people)
+bmis <- range(~ BMI, data = people)
+res <- 100
+fake_grid <- expand.grid(
+  Age = seq(from = ages[1], to = ages[2], length.out = res),
+  BMI = seq(from = bmis[1], to = bmis[2], length.out = res))
+
+#Get the overall proportion, p, of Diabetics
+
+p <- sum(people$Diabetes == 1)/length(people$Diabetes)
+
+# Null model prediction
+
+pred_null <- rep(p, nrow(fake_grid))
+
+# reinitialize the people dataset - fix Diabetes
+# back to factor of "Yes" and "No"
+
+#people <- NHANES[, c("Age", "Gender", "Diabetes", 
+#                     "BMI", "HHIncome", "PhysActive")]
+#people <- na.omit(people)
+#people <- as.data.frame(people)
+
+people <- NHANES %>% 
+  dplyr::select(Age, Gender, Diabetes, BMI, HHIncome, PhysActive) %>% 
+  na.omit()
+
+form <- as.formula("Diabetes ~ Age + BMI")
+
+# Evaluate each model on each grid point
+# For the decision tree
+
+dmod_tree <- rpart(form, data = people, 
+                   control = rpart.control(cp = 0.005, minbucket = 30))
+
+# For the forest
+
+set.seed(20371)
+#dmod_forest <- rfsrc(form, data = people, 
+#                     ntree = 201, mtry = 3)
+# try with randomForest instead of randomForestSRC package
+library(randomForest)
+dmod_forest <- randomForest(form, data = people, 
+                     ntree = 201, mtry = 2)
+
+# Now the predictions for tree and forest
+
+pred_tree <- predict(dmod_tree, newdata = fake_grid)[, "Yes"]
+# pred_tree <- predict(dmod_tree, newdata = fake_grid)[, 1]
+pred_forest <- predict(dmod_forest, newdata = fake_grid, 
+                       type = "prob")[, "Yes"]
+
+# K-nearest neighbor prediction
+
+pred_knn <- people %>%
+  select(Age, BMI) %>%
+  knn(test=select(fake_grid, Age, BMI), cl = people$Diabetes, k=5) %>%
+  as.numeric() - 1
+
+```
+
+
+Next, we want to build a dataframe with all of these predicted models, then `gather()` it into a long format.
+
+```{r}
+
+# build the data frame
+
+res <- fake_grid %>%
+  mutate(
+    "Null" = pred_null, "Decision Tree" = pred_tree,
+    "Random Forest" = pred_forest, "K-nearest neighbor" = pred_knn
+  ) %>%
+  gather(k="model", value = "y_hat", -Age, -BMI)
+
+```
+
+Next let's plot all of these
+
+```{r}
+
+
+ggplot(data = res, aes(x = Age, y = BMI)) +
+  geom_tile(aes(fill=y_hat), color = NA) +
+  geom_count(aes(color = Diabetes), alpha = 0.4, data = people) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  scale_color_manual(values = c("gray", "gold")) +
+  scale_size(range = c(0,2)) +
+  scale_x_continuous(expand = c(0.02, 0)) +
+  scale_y_continuous(expand = c(0.02, 0)) +
+  facet_wrap(~model)
+
+length(pred_knn)
+length(pred_tree)
+length(pred_forest)
+
+```
+
+
+
+
+
+All of the work that we have done with trees and forests is all fine and good except that it assumes that your division is linear. So what do you do if your data look like this graph brazenly borrowed from Gareth James?
+
+
+
+![Alt](2.13.pdf){width=100% height=1200}
+
+Or like this graph also brazenly borrowed from Gareth James?
+
+![Alt](9.8.pdf){width=100% height=1200}
+
+The K-nearest neighbor approach will help with the first predicament. 
+
+But for the second predicament we are going to need something different.
+
+And now for something different...
+
+Suppose that we have data that look like thus:
+
+![Alt](MMCpointsonly.pdf){width=100% height=1200}
+
+
+
+These data can be perfectly separated by a hyperplane (in 2-dimensions, this is a line), like so:
+
+![Alt](MMChyperplane.pdf){width=100% height=1200}
+
+
+
+
+This line is the one that is the furthest from the closest points of either group, and it is called the Maximal Margin Classifier, that is, the margins to the closest points are as large as possible for any line that you could draw, as so:
+
+![Alt](MMCdash.pdf){width=100% height=1200}
+
+
+
+This classifier will only work if you can draw a hyperplane to separate the groups.
+
+The problem with MMC's - they are very sensitive to the tiny changes in the data. For instance, look at the figure below. There is only 1 point that is different from the previous scatterplot.
+
+![Alt](MMConepointmore.pdf){width=100% height=1200}
+
+
+
+Yet, that causes a huge change in the MMC, as shown below:
+
+![Alt](MMConepointorehyperplane.pdf){width=100% height=1200}
+
+
+
+What if your data look like this:
+
+![Alt](MMCnogo.pdf){width=100% height=1200}
+
+
+
+For these data you can't draw a line that separates them.
+
+What to do?
+
+### Support Vector Classifiers
+
+The goal is to create a classifier created based on a hyperplane that may not perfectly separate classes but does offer greater robustness to the effects of individual observations, and better classification of most of the training observations. The *support vector classifier* does exactly that. This is sometimes called a *soft margin classifier* 
+
+Recall our MMC. It could be that a classifier like this might actually work - it classifies 5 wrong, but gets most right, and it should be fairly robust. The support vectors in this case are the dashed lines. The objective is to minimize prediction error, but we can allow some values to be on the incorrect side of the margin or even the incorrect side of the hyperplane. In that case the margins are considered "soft". 
+
+### Support Vector Machines
+
+All of that is fine and good, but what if we have data that look as follows (brazenly borrowed by Gareth James):
+
+![Alt](9.8.pdf){width=100% height=1200}
+
+
+
+As we see on the left there appear to be at least 2, maybe 3 groups. And, as we see on the right, an SVC is useless.
+
+So we have to think about using *non-linear* boundaries instead, as shown below (brazenly borrowed by Gareth James):
+
+![Alt](9.9.pdf){width=100% height=1200}
+
+
+
+So we will want to *enlarge* our feature space by using functions of our features, in particular, polynomial terms, in order to develop these boundaries. We will do this by using what is called a *kernel* function. The definition of a kernel is beyond the scope of this class. But it turns out that there are computational methods to produce these extended features in a computationally efficient manner, and that the linear SVC can be represented by these features as well. All of this will only involve what is called the inner product of two observations. For two observations X_i and X_{i'} the inner product is
+
+\begin{equation}
+
+
+
+<X_i, X_{i'}> = \sum_{j=1}^{p} {x_{ij}x_{i'j}}
+
+\end{equation}
+
+Let's look at an example or two. Consider the Khan dataset in the ISLR package. It contains expression levels for a number of genes corresponding to four types of small round blue cell tumors. There is a set of training data and a set of testing data.
+
+```{r}
+
+# Call up ISLR, which contains the dataset, and e1071, which contains the function for fitting an SVM
+
+library(ISLR)
+library(e1071)
+
+# What is in the Khan data set?
+
+names(Khan)
+
+# What are the dimensions of the objects in the Khan dataset?
+
+dim(Khan$xtrain)
+dim(Khan$xtest)
+dim(Khan$ytrain)
+dim(Khan$ytest)
+
+# How do the observations in the training and testing datasets distribute among the tumor type classes?
+
+table(Khan$ytrain)
+table(Khan$ytest)
+
+
+
+```
+
+We will use a support vector approach to predict tumor type from gene expression levels. 
+
+There are a very large number of features relative to the number of observations. In this case, we should use a linear kernel.
+
+```{r}
+
+# Create the data frame consisting of the training data
+
+dat <- data.frame(x=Khan$xtrain, y = as.factor(Khan$ytrain))
+
+# Run the svm() function on the training data using a linear kernel
+
+out <- svm(y~., data = dat, kernel = "linear")
+
+# What is in this new object created by the svm() function?
+
+summary(out)
+
+# How well does this SVM predict the training data?
+
+table(out$fitted, dat$y)
+```
+
+We see that there are no training errors. This is not surprising, since the large number of features relative to observations guarantees that you can find any number of hyperplanes that will fully separate the observations. 
+
+So what about the SVM's performance on the test observations?
+
+```{r}
+
+# Create the dataframe for the testing data
+
+dat.test <- data.frame(x=Khan$xtest, y= as.factor(Khan$ytest))
+
+# Use the SVM we just created to classify the test dataset
+
+pred.test <- predict(out, newdata = dat.test)
+
+# How well does this SVM do at classifying the test dataset?
+
+table(pred.test, dat.test$y)
+```
+
+We see that there are 2 errors, or a 10% error rate.
+
+
+
+# Unsupervised learning
+
+For Act III today we will talk about unsupervised learning - that is we want to discover patterns in the data without an *a priori* understanding of any grouping structure.
+
+There are a couple of ways to do this. We will talk about k-means clustering and principal components analysis (PCA).
+
+## Clustering
+
+You have probably all seen an example of an evolutionary tree - sometimes also called a dendogram. Although biologists will imagine that at each branching point there was an actual being (plant or animal), the descendants of whom split into groups that evolved in different directions. They will group similar beings close to each other, and not-so-similar ones at further distances. But you will note that there is no outcome variable - just decisions as to what is close and what is far with respect to relatedness.
+
+In general you can use trees to describe the similarity between objects, regardless of how they came to be. The tree may or may not be a reflection of something deeper about the objects and their relationships - it can just be a simple way to visualize relationships.
+
+To develop these trees from a set of numerical variables, none of which constitutes a *response* you would need to plot the data as points in space then make branches based on how close together points are. This technique is called _hierarchical clustering_.
+
+The `NCI60` dataset contains microarray gene expression levels on 6830 genes for 68 cancer cell lines. Although cancer cell type is recorded, we are going to explore how the data group without considering this variable, then look at how closely the *de novo* grouping compares to the cell types. The data come from the publication by Ross et al (Nature Genetics, 2000). The dataset is available in the `ISLR` package. The `ape` package contains many functions for phylogenetic trees.
+
+```{r}
+library(tidyverse)
+library(maps)
+library(ISLR)
+library(ape)
+
+nci.labs <- NCI60$labs # Labels for checking later
+nci.data <- NCI60$data
+
+# What do the data look like?
+dim(nci.data)
+length(nci.labs)
+nci.labs[1:4]
+table(nci.labs)
+
+
+# Scale the data before clustering
+sd.data <- scale(nci.data)
+
+# Calculate Euclidean distance between each pair of points
+data.dist <- dist(sd.data)
+
+# Plot the tree, default linkage is 'complete'
+plot(hclust(data.dist), labels = nci.labs, main = "Complete Linkage", xlab = "",
+     sub = "", ylab = "")
+
+# Plot the tree, linkage is 'average'
+plot(hclust(data.dist), method = "average", labels = nci.labs, main = "Average Linkage", xlab = "", 
+     sub = "", ylab = "")
+
+# Plot the tree, default linkage is 'single'
+plot(hclust(data.dist), method = "single", labels = nci.labs, main = "Single Linkage", xlab = "", 
+     sub = "", ylab = "")
+
+
+
+
+
+```
+
+How do you think these trees compare?
+
+Which one should we use?
+
+```{r}
+# Let's use complete linkage and cut into 4 clusters
+
+hc.out <- hclust(dist(sd.data))
+hc.clusters <- cutree(hc.out, 4)
+table(hc.clusters, nci.labs)
+
+
+```
+
+Where are the leukemia cases? What about the breast cancer cases?
+
+Where in the tree is the cut that yielded the 4 clusters?
+
+```{r}
+# plot the cut in the tree that yielded the 4 clusters
+
+plot(hc.out, labels = nci.labs)
+abline(h=139, col = "red")
+```
+
+Let's look at the summary of the tree:
+
+```{r}
+# Summary of hierarchical clustering
+hc.out
+```
+### K-means clustering
+
+
+An alternative method of clustering is _K-means clustering_. Again, we place our points in space, and decide on groups, but we do so without consideration of hierarchy. 
+
+Let's see how these two types of clustering compare on the `NCI60` dataset:
+
+```{r}
+
+# K-means clustering with K=4 (from the hierarchical clustering number)
+
+set.seed(40523)
+km.out = kmeans(sd.data, 4, nstart = 20)
+km.clusters = km.out$cluster
+table(km.clusters, hc.clusters)
+
+```
+
+How do the clustering methods compare?
+
+Which clusters are found by both methods?
+
+### Another example
+
+Let's look at another example. We have data about the cities in the world in the dataset`WorldCities`. For the 4000 largest cities, considering *only* latitude and longitude (two of the *features* of this dataset), how would these data items group and plot?
+
+```{r}
+#get the 4000 largest cities, variables are only latitude and longitude
+
+BigCities <- world.cities %>%
+  arrange(desc(pop)) %>%
+  head(4000) %>%
+  dplyr::select(long, lat)
+glimpse(BigCities)
+```
+
+Notice that the `BigCities` dataset does not even contain the names of the cities, *just* latitude and longitude.
+
+```{r}
+library(mclust)
+set.seed(15)
+city_clusts <- BigCities %>%
+  kmeans(centers = 6) %>%
+  fitted("classes") %>%
+  as.character()
+BigCities <- BigCities %>% mutate(cluster = city_clusts)
+BigCities %>% ggplot(aes(x=long, y=lat)) +
+  geom_point(aes(color = cluster), alpha = 0.5)
+```
+
+
+
+### Principal Components Analysis
+
+Another way to learn more about the data is to reduce dimensionality. If you have ever had a course in matrix algebra, one technique to reduce the dimensionality of a matrix is called *Singular Value Decomposition* (SVD). Of course in statistics (unlike in mathematics) data are typically messy, and so we use a tool called *Principal Components Analysis* (PCA) which is, at its core, just SVD.
+
+Let's set the stage with an example. Suppose we have the heights of 100 pairs of twins (or, if you prefer, suppose you have the expression levels of 2 genes for 100 samples). Let's plot them:
+
+![Alt](Firstplot.pdf){width=100% height=1200}
+
+
+
+You will notice that the data live in two dimensions, but they appear to be somewhat linear. We can _rotate_ this plot so that it makes a bit more sense, but taking the average of the twin heights and plotting it against the difference of the heights. Let's take a look:
+
+![Alt](rotated.pdf){width=100% height=1200}
+
+
+
+The two orange points are the same in each plot, and you will note that the rotation preserves the distance between them.
+
+Now suppose you have expression levels for 1000 genes, and you want to look at their plots. You can't visualize this in 1000 x 1000 space, and if you do them pairwise you will need to examine almost 500,000 graphs. This is just too much. Plus not all of the variables are, well, interesting. So we want to reduce the dimensions.
+
+One other thing to notice about the rotated graph: Most of the "action" is in the first dimension. This is the point, if you will, of PCA. It allows us to summarize our data (our features, our variables) with a smaller number of related variables that explain most of the variability of our original data. That is, PCA gives you a low-dimensional transformation of the data set such that these components contain as much as possible of the variation. It gives you a data representation in a smaller number of dimensions that are as "interesting"" as possible. By *interesting* we mean here the amount of variations of the observations in each dimension.
+
+Just as we did with the example above, we seek a normalized, linear combination of our features that has the highest variance, then the next highest, etc. 
+
+Let's work through an example, continuing our work with the NCI60 dataset:
+
+```{r}
+
+# Find the principal components of the normalized data
+pr.out <- prcomp(nci.data, scale = TRUE)
+
+# Color assignment for each of the 64 cell lines
+Cols <- function(vec){
+  cols=rainbow(length(unique(vec)))
+  return(cols[as.numeric(as.factor(vec))])
+}
+
+# Plot the principal component score vectors
+par(mfrow = c(1,2), pin=c(3,3))
+plot(pr.out$x[, 1:2], col = Cols(nci.labs), pch=19, xlab= "Z1", ylab = "Z2")
+plot(pr.out$x[, c(1,3)], col = Cols(nci.labs), pch=19, xlab= "Z1", ylab = "Z3")
+
+```
+
+These color plots aren't really all that interesting nor are they particularly informative.
+
+But wait, there's more!
+
+Each component has a value associated with it that is the percent of variance explained (PVE).
+
+```{r}
+# See what all is in the object
+summary(pr.out)
+
+plot(pr.out)
+
+pve = 100*pr.out$sdev^2/sum(pr.out$sdev^2)
+pve
+plot(pve, type = "o", ylab = "Cumulative PVE", xlab = "Principal Component", col="blue")
+plot(cumsum(pve), type = "o", ylab = "Cumulative PVE", xlab = "Principal Component", col="brown3")
+
+
+
+```
+
+
+You will notice from the first plot that there is a drop-off (elbow) in PVE from component 6 to 7. Also you will notice in the histogram that there is a substantial dropoff in PVE going from component 1 to 2. So you can safely reduce this dataset to representation by at most 6 components, and if you feel like living dangerously, to 2 components.  These are called scree plots. You should definitely look at these scree plots as you evaluate the results of a principal components analysis, and you should ask to see them as well for any that you happen upon in your reading.
+
+### Multi-dimensional scaling
+
+Another unsupervised learning technique is Multi-dimensional Scaling (MDS). We want to know about differences between observations. So, for instance, let's consider the Khan dataset again. We are going to take differences of the individual observations and the overall mean, then we are going to use PCA again to examine the results. Except, since we are doing this on the observation - mean differences, it is no longer strictly PCA, and it is not called *Principal Coordinate Analysis* or PCoA. But the principles from PCA are still useful - we are going to use the first two principal *coordinates* to plot, because those will capture most of the variability in these differences.
+
+```{r}
+# Use the nci.data set again
+
+
+
+# Assume we have N observations and p variables in an N x P dataset
+
+dim(nci.data)
+
+d <- dist(nci.data)
+fit <- cmdscale(d, eig=TRUE, k=2)
+
+# k is the number of principal coordinates we want
+
+# view the results
+
+fit
+
+# plot it
+
+x <- fit$points[,1]
+y <- fit$points[,2]
+
+plot(x, y, xlab = "PCo1", ylab = "PCo2",
+     main = "Metric MDS", type = "n")
+text(x, y, labels = nci.labs, cex = 0.7)
+
+
+
+
+```
+
+We can also do what is called nonmetric MDS, using a function from the MASS package.
+
+```{r}
+
+library(MASS)
+
+fit <- isoMDS(d, k=2)
+
+x <- fit$points[,1]
+y <- fit$points[,2]
+
+plot(x, y, xlab = "PCo1", ylab = "PCo2",
+     main = "nonMetric MDS", type = "n")
+text(x, y, labels = nci.labs, cex = 0.7)
+
+```
+
+
+
+
+
+
+
+
